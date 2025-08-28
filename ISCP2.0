@@ -1,0 +1,115 @@
+import pandas as pd
+import re
+import json
+import ast
+
+# Input and output file paths
+input_file = "iscp_pii_dataset_-_Sheet1.csv"
+output_file = "redacted_output_candidate_full_name.csv"
+
+# Regex patterns for standalone PII
+patterns = {
+    "phone": re.compile(r"\b[6-9]\d{9}\b"),
+    "aadhar": re.compile(r"\b\d{12}\b"),
+    "passport": re.compile(r"\b[A-Z][0-9]{7}\b", re.IGNORECASE),
+    "upi_id": re.compile(r"\b[\w\.-]+@[a-zA-Z]{2,}\b"),
+    "email": re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}"),
+    "ip_address": re.compile(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b")
+}
+
+# Masking functions
+def mask_phone(phone):
+    return phone[:2] + "XXXXXX" + phone[-2:]
+
+def mask_aadhar(aadhar):
+    return aadhar[:4] + " XXXX XXXX " + aadhar[-4:]
+
+def mask_passport(passport):
+    return passport[0] + "XXXXXXX"
+
+def mask_upi(upi):
+    return upi[:3] + "XXX@" + upi.split("@")[-1]
+
+def mask_email(email):
+    parts = email.split("@")
+    return parts[0][:2] + "XXX@" + parts[1]
+
+def mask_ip(ip):
+    return "XXX.XXX.XXX." + ip.split(".")[-1]
+
+def mask_name(full_name):
+    parts = full_name.split()
+    return " ".join([p[0] + "XXX" for p in parts])
+
+# Safe JSON loader
+def safe_load(record):
+    try:
+        return json.loads(record)
+    except:
+        try:
+            return ast.literal_eval(record)  # fallback for malformed JSON
+        except:
+            return {}
+
+# PII detection function
+def detect_and_redact(record):
+    is_pii = False
+    data = safe_load(record)
+
+    redacted = {}
+    contains_name = bool(data.get("name")) and len(data["name"].split()) >= 2
+    contains_email = bool(data.get("email"))
+    contains_address = bool(data.get("address"))
+    contains_ip = bool(data.get("ip_address"))
+
+    for key, value in data.items():
+        if not value or not isinstance(value, str):
+            redacted[key] = value
+            continue
+
+        val = value.strip()
+
+        if patterns["phone"].fullmatch(val):
+            is_pii = True
+            redacted[key] = mask_phone(val)
+        elif patterns["aadhar"].fullmatch(val):
+            is_pii = True
+            redacted[key] = mask_aadhar(val)
+        elif patterns["passport"].fullmatch(val):
+            is_pii = True
+            redacted[key] = mask_passport(val)
+        elif patterns["upi_id"].fullmatch(val):
+            is_pii = True
+            redacted[key] = mask_upi(val)
+        elif patterns["email"].fullmatch(val):
+            if contains_name or contains_address or contains_ip:
+                is_pii = True
+                redacted[key] = mask_email(val)
+            else:
+                redacted[key] = val
+        elif contains_name and patterns["ip_address"].fullmatch(val):
+            is_pii = True
+            redacted[key] = mask_ip(val)
+        elif key == "name" and contains_name:
+            is_pii = True
+            redacted[key] = mask_name(val)
+        elif key == "address" and contains_address:
+            is_pii = True
+            redacted[key] = "[REDACTED_PII]"
+        else:
+            redacted[key] = val
+
+    return json.dumps(redacted), is_pii
+
+# Main pipeline
+if __name__ == "__main__":
+    df = pd.read_csv(input_file)
+
+    results = df["data_json"].apply(lambda x: detect_and_redact(x))
+
+    df["redacted_data_json"] = results.apply(lambda x: x[0])
+    df["is_pii"] = results.apply(lambda x: x[1])
+
+    output_df = df[["record_id", "redacted_data_json", "is_pii"]]
+    output_df.to_csv(output_file, index=False)
+    print(f"[+] Redacted CSV saved to {output_file}")
